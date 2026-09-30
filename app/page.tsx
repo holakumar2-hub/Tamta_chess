@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useMemo, useState } from "react";
 import { Chess, Move } from "chess.js";
+import { supabase } from "../lib/supabase";
 
 const glyph: Record<string,string> = {
   wK:"♔",wQ:"♕",wR:"♖",wB:"♗",wN:"♘",wP:"♙",
@@ -24,11 +25,10 @@ function minimax(game:Chess, depth:number, alpha:number, beta:number, maximizing
     let best=-Infinity;
     for(const m of moves){ game.move(m); best=Math.max(best,minimax(game,depth-1,alpha,beta,false)); game.undo(); alpha=Math.max(alpha,best); if(beta<=alpha) break; }
     return best;
-  } else {
-    let best=Infinity;
-    for(const m of moves){ game.move(m); best=Math.min(best,minimax(game,depth-1,alpha,beta,true)); game.undo(); beta=Math.min(beta,best); if(beta<=alpha) break; }
-    return best;
   }
+  let best=Infinity;
+  for(const m of moves){ game.move(m); best=Math.min(best,minimax(game,depth-1,alpha,beta,true)); game.undo(); beta=Math.min(beta,best); if(beta<=alpha) break; }
+  return best;
 }
 function aiMove(game:Chess):Move|null{
   const moves=game.moves({verbose:true}) as Move[];
@@ -43,15 +43,32 @@ function aiMove(game:Chess):Move|null{
   return bestMove;
 }
 
+type Mode = "ai" | "friend";
+type PlayerColor = "w" | "b";
+
+function getPlayerToken(){
+  if(typeof window==="undefined") return "";
+  const existing=localStorage.getItem("tamta_chess_player");
+  if(existing) return existing;
+  const token=crypto.randomUUID();
+  localStorage.setItem("tamta_chess_player",token);
+  return token;
+}
+
 export default function Home(){
+  const [mode,setMode]=useState<Mode>("ai");
   const [game,setGame]=useState(()=>new Chess());
   const [selected,setSelected]=useState<string|null>(null);
   const [thinking,setThinking]=useState(false);
+  const [humanColor,setHumanColor]=useState<PlayerColor>("w");
+  const [friendId,setFriendId]=useState<string|null>(null);
+  const [friendColor,setFriendColor]=useState<PlayerColor|null>(null);
+  const [friendStatus,setFriendStatus]=useState("");
   const [,refresh]=useState(0);
-  const [humanColor,setHumanColor]=useState<"w"|"b">("w");
 
   const board=game.board();
   const history=game.history();
+
   const status=useMemo(()=>{
     if(game.isCheckmate()) return game.turn()==="w" ? "Black wins" : "White wins";
     if(game.isDraw()) return "Draw";
@@ -60,7 +77,16 @@ export default function Home(){
   },[game,history]);
 
   useEffect(()=>{
-    if(game.isGameOver() || game.turn()===humanColor || thinking) return;
+    const params=new URLSearchParams(window.location.search);
+    const id=params.get("game");
+    if(id){
+      setMode("friend");
+      setFriendId(id);
+    }
+  },[]);
+
+  useEffect(()=>{
+    if(mode!=="ai" || game.isGameOver() || game.turn()===humanColor || thinking) return;
     setThinking(true);
     const timer=setTimeout(()=>{
       const next=aiMove(game);
@@ -68,34 +94,119 @@ export default function Home(){
       setThinking(false); refresh(v=>v+1);
     },350);
     return()=>clearTimeout(timer);
-  },[game,history,humanColor,thinking]);
+  },[game,history,humanColor,thinking,mode]);
+
+  useEffect(()=>{
+    if(mode!=="friend" || !friendId || !supabase) return;
+    let active=true;
+    const load=async()=>{
+      const {data,error}=await supabase.from("games").select("*").eq("id",friendId).single();
+      if(!active) return;
+      if(error || !data){setFriendStatus("GAME NOT FOUND");return;}
+      const token=getPlayerToken();
+      let color:PlayerColor|null=data.white_player_id===token?"w":data.black_player_id===token?"b":null;
+      if(!color && !data.black_player_id && data.white_player_id!==token){
+        const {data:joined,error:joinError}=await supabase.from("games").update({black_player_id:token,status:"active",updated_at:new Date().toISOString()}).eq("id",friendId).is("black_player_id",null).select().single();
+        if(!joinError && joined) { data=joined; color="b"; }
+      }
+      if(!color && !data.white_player_id){
+        const {data:joined,error:joinError}=await supabase.from("games").update({white_player_id:token,status:"active",updated_at:new Date().toISOString()}).eq("id",friendId).is("white_player_id",null).select().single();
+        if(!joinError && joined) { data=joined; color="w"; }
+      }
+      if(!color){setFriendStatus("GAME IS FULL");return;}
+      const next=new Chess(data.fen);
+      setGame(next); setFriendColor(color); setHumanColor(color);
+      setFriendStatus(data.black_player_id ? "OPPONENT CONNECTED" : "WAITING FOR OPPONENT");
+    };
+    load();
+    const channel=supabase.channel("game-"+friendId).on("postgres_changes",{event:"UPDATE",schema:"public",table:"games",filter:"id=eq."+friendId},payload=>{
+      const data=payload.new as any;
+      const next=new Chess(data.fen);
+      setGame(next);
+      const token=getPlayerToken();
+      const color=data.white_player_id===token?"w":data.black_player_id===token?"b":null;
+      if(color) setFriendColor(color);
+      setFriendStatus(data.black_player_id ? "OPPONENT CONNECTED" : "WAITING FOR OPPONENT");
+    }).subscribe();
+    return()=>{active=false;supabase.removeChannel(channel);};
+  },[mode,friendId]);
+
+  async function createFriendGame(){
+    if(!supabase){setFriendStatus("SUPABASE IS NOT CONFIGURED");return;}
+    const token=getPlayerToken();
+    const fresh=new Chess();
+    const {data,error}=await supabase.from("games").insert({
+      white_player_id:token,status:"waiting",fen:fresh.fen(),moves:[]
+    }).select("id").single();
+    if(error || !data){setFriendStatus("COULD NOT CREATE GAME");return;}
+    const url=window.location.origin+"?game="+data.id;
+    window.history.replaceState({}, "", "?game="+data.id);
+    setMode("friend"); setFriendId(data.id); setFriendColor("w"); setHumanColor("w"); setGame(fresh); setFriendStatus("WAITING FOR OPPONENT");
+    try{await navigator.clipboard.writeText(url);setFriendStatus("LINK COPIED · WAITING FOR OPPONENT")}catch{}
+  }
+
+  async function makeFriendMove(from:string,to:string){
+    if(!supabase || !friendId || !friendColor || game.turn()!==friendColor || game.isGameOver()) return;
+    const moving=new Chess(game.fen());
+    let move:Move;
+    try{move=moving.move({from,to,promotion:"q"});}catch{return;}
+    const moves=[...moving.history()];
+    const nextFen=moving.fen();
+    const {error}=await supabase.from("games").update({fen:nextFen,moves,updated_at:new Date().toISOString(),status:moving.isGameOver()?"finished":"active"}).eq("id",friendId);
+    if(error){setFriendStatus("MOVE FAILED");return;}
+    setGame(moving);setSelected(null);refresh(v=>v+1);
+    await supabase.from("game_moves").insert({game_id:friendId,move_number:moves.length,player_color:friendColor==="w"?"white":"black",san:move.san,from_square:from,to_square:to});
+  }
 
   function reset(color=humanColor){
-    setGame(new Chess()); setSelected(null); setThinking(false); setHumanColor(color); refresh(v=>v+1);
+    setGame(new Chess());setSelected(null);setThinking(false);setHumanColor(color);refresh(v=>v+1);
   }
   function clickSquare(square:string){
+    if(mode==="friend"){
+      if(!friendColor || game.turn()!==friendColor || game.isGameOver()) return;
+      const piece=game.get(square as any);
+      if(selected){ makeFriendMove(selected,square); return; }
+      if(piece && piece.color===friendColor) setSelected(square); else setSelected(null);
+      return;
+    }
     if(thinking || game.isGameOver() || game.turn()!==humanColor) return;
     const piece=game.get(square as any);
     if(selected){
-      try {
-        game.move({from:selected,to:square,promotion:"q"});
-        setSelected(null); refresh(v=>v+1); return;
-      } catch {}
+      try{game.move({from:selected,to:square,promotion:"q"});setSelected(null);refresh(v=>v+1);return;}catch{}
     }
     if(piece && piece.color===humanColor) setSelected(square); else setSelected(null);
   }
   function undo(){
-    if(thinking) return;
-    game.undo(); if(game.history().length) game.undo();
-    setSelected(null); refresh(v=>v+1);
+    if(mode==="friend" || thinking) return;
+    game.undo();if(game.history().length)game.undo();setSelected(null);refresh(v=>v+1);
   }
+  function leaveFriend(){
+    window.history.replaceState({}, "", "/");
+    setMode("ai");setFriendId(null);setFriendColor(null);setFriendStatus("");setGame(new Chess());setSelected(null);
+  }
+
   const shownRows=humanColor==="w"?board:[...board].reverse();
   const shownFiles=humanColor==="w"?files:[...files].reverse();
 
   return <main>
-    <header><div className="brand">TAMTA <span>CHESS</span></div><div className="status">{thinking?"THINKING":status.toUpperCase()}</div></header>
+    <header><div className="brand">TAMTA <span>CHESS</span></div><div className="status">{mode==="friend"?friendStatus:(thinking?"THINKING":status.toUpperCase())}</div></header>
+
+    {mode==="ai" && <section className="home-panel">
+      <div className="home-title">PLAY</div>
+      <div className="home-actions">
+        <button onClick={()=>reset("w")}>PLAY AI</button>
+        <button onClick={createFriendGame}>PLAY FRIEND</button>
+      </div>
+    </section>}
+
     <section className="game">
-      <div className="clock-row"><div>YOU · {humanColor==="w"?"WHITE":"BLACK"}</div><div>V1 · HUMAN VS AI</div><div>AI · {humanColor==="w"?"BLACK":"WHITE"}</div></div>
+      <div className="clock-row"><div>{mode==="friend"?"YOU · "+(friendColor==="w"?"WHITE":"BLACK"):"YOU · "+(humanColor==="w"?"WHITE":"BLACK")}</div><div>{mode==="friend"?"FRIEND GAME":"V1 · HUMAN VS AI"}</div><div>{mode==="friend"?"OPPONENT":"AI · "+(humanColor==="w"?"BLACK":"WHITE")}</div></div>
+
+      {mode==="friend" && friendId && <div className="share-row">
+        <span>GAME {friendId.slice(0,8).toUpperCase()}</span>
+        <button onClick={()=>navigator.clipboard.writeText(window.location.href)}>COPY LINK</button>
+      </div>}
+
       <div className="board">
         {shownRows.map((row,ri)=>row.map((piece,ci)=>{
           const square=shownFiles[ci]+(humanColor==="w"?8-ri:ri+1);
@@ -105,7 +216,11 @@ export default function Home(){
           </button>
         }))}
       </div>
-      <div className="controls"><button onClick={()=>reset("w")}>NEW GAME</button><button onClick={()=>reset(humanColor==="w"?"b":"w")}>PLAY AS {humanColor==="w"?"BLACK":"WHITE"}</button><button onClick={undo}>UNDO</button></div>
+
+      <div className="controls">
+        {mode==="ai" ? <><button onClick={()=>reset("w")}>NEW GAME</button><button onClick={()=>reset(humanColor==="w"?"b":"w")}>PLAY AS {humanColor==="w"?"BLACK":"WHITE"}</button><button onClick={undo}>UNDO</button></> : <button onClick={leaveFriend}>LEAVE GAME</button>}
+      </div>
+
       <div className="lower">
         <div><div className="label">MOVES</div><div className="moves">{history.length?history.map((m,i)=><span key={i}>{i%2===0?Math.floor(i/2)+1+". ":""}{m}</span>):"No moves yet"}</div></div>
         <div className="note">A quiet board.<br/>A difficult opponent.</div>
